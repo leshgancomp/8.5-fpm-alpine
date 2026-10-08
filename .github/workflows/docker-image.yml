@@ -1,0 +1,280 @@
+name: Build and Push Docker Image
+
+on:
+  push:
+    tags:
+      - v*
+  pull_request:
+    branches: [latest]
+  workflow_dispatch:
+  schedule:
+    # Weekly rebuild to get latest base image updates
+    - cron: '0 2 * * 1'
+
+env:
+  IMAGE_NAME: exploitit/php-8.5-fpm-alpine
+  REGISTRY: docker.io
+
+jobs:
+  # Build multi-platform images efficiently
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      image_digest: ${{ steps.build-and-push.outputs.digest }}
+      image_metadata: ${{ steps.build-and-push.outputs.metadata }}
+      image_tags: ${{ steps.meta.outputs.tags }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4.2.0
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3.6.1
+        with:
+          driver-opts: |
+            network=host
+
+      - name: Log in to Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3.3.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5.5.1
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=ref,event=tag
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/latest' }}
+            type=schedule,pattern={{date 'YYYYMMDD'}}
+          labels: |
+            org.opencontainers.image.title=PHP 8.4 FPM Alpine Development
+            org.opencontainers.image.description=PHP 8.4 FPM with common extensions on Alpine Linux
+            org.opencontainers.image.vendor=leshgancomp
+            maintainer=leshgancomp
+
+      - name: Build and push multi-platform
+        id: build-and-push
+        uses: docker/build-push-action@v6.7.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+          build-args: |
+            TZ=UTC
+
+  # Security scanning
+  security-scan:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Extract image reference
+        id: image-ref
+        run: |
+          # Use digest if available, otherwise use first tag
+          if [ -n "${{ needs.build-and-push.outputs.image_digest }}" ]; then
+            IMAGE_REF="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build-and-push.outputs.image_digest }}"
+          else
+            TAGS='${{ needs.build-and-push.outputs.image_tags }}'
+            IMAGE_REF=$(echo "$TAGS" | head -n1)
+          fi
+          echo "image-ref=${IMAGE_REF}" >> $GITHUB_OUTPUT
+          echo "Using image reference: ${IMAGE_REF}"
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ steps.image-ref.outputs.image-ref }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+          category: 'trivy'
+
+      - name: Run Trivy for critical vulnerabilities
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          image-ref: ${{ steps.image-ref.outputs.image-ref }}
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+
+  # Comprehensive image testing
+  test-image:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+
+    steps:
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3.6.1
+
+      - name: Extract image reference
+        id: image-ref
+        run: |
+          # Use digest if available, otherwise use first tag
+          if [ -n "${{ needs.build-and-push.outputs.image_digest }}" ]; then
+            IMAGE_REF="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build-and-push.outputs.image_digest }}"
+          else
+            TAGS='${{ needs.build-and-push.outputs.image_tags }}'
+            IMAGE_REF=$(echo "$TAGS" | head -n1)
+          fi
+          echo "image-ref=${IMAGE_REF}" >> $GITHUB_OUTPUT
+          echo "Using image reference: ${IMAGE_REF}"
+
+      - name: Test PHP version and basic functionality
+        run: |
+          echo "Testing PHP version..."
+          docker run --rm --platform ${{ matrix.platform }} \
+            ${{ steps.image-ref.outputs.image-ref }} \
+            php -v
+
+      - name: Test required PHP extensions
+        run: |
+          echo "Testing PHP extensions..."
+          docker run --rm --platform ${{ matrix.platform }} \
+            ${{ steps.image-ref.outputs.image-ref }} \
+            php -m | grep -E "(bcmath|exif|gd|gmp|intl|mysqli|pcntl|pdo_mysql|pdo_pgsql|redis|sockets|xsl|zip|amqp)"
+
+      - name: Test FPM process and configuration
+        run: |
+          echo "Testing PHP-FPM process..."
+          CONTAINER_ID=$(docker run -d --platform ${{ matrix.platform }} \
+            ${{ steps.image-ref.outputs.image-ref }})
+          
+          sleep 10
+          
+          # Check if php-fpm is running
+          docker exec $CONTAINER_ID ps aux | grep php-fpm
+          
+          # Test FPM status endpoint
+          docker exec $CONTAINER_ID php-fpm -t
+          
+          # Cleanup
+          docker stop $CONTAINER_ID
+          docker rm $CONTAINER_ID
+
+      - name: Test user permissions
+        run: |
+          echo "Testing user permissions..."
+          docker run --rm --platform ${{ matrix.platform }} \
+            ${{ steps.image-ref.outputs.image-ref }} \
+            sh -c "whoami && id"
+
+      - name: Test timezone configuration
+        run: |
+          echo "Testing timezone..."
+          docker run --rm --platform ${{ matrix.platform }} \
+            ${{ steps.image-ref.outputs.image-ref }} \
+            date
+
+  # Performance benchmarking (optional)
+  benchmark:
+    needs: [build-and-push, test-image]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - name: Extract image reference
+        id: image-ref
+        run: |
+          # Use digest if available, otherwise use first tag
+          if [ -n "${{ needs.build-and-push.outputs.image_digest }}" ]; then
+            IMAGE_REF="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build-and-push.outputs.image_digest }}"
+          else
+            TAGS='${{ needs.build-and-push.outputs.image_tags }}'
+            IMAGE_REF=$(echo "$TAGS" | head -n1)
+          fi
+          echo "image-ref=${IMAGE_REF}" >> $GITHUB_OUTPUT
+          echo "Using image reference: ${IMAGE_REF}"
+
+      - name: Run basic performance test
+        run: |
+          echo "Running basic PHP performance test..."
+          docker run --rm --platform linux/amd64 \
+            ${{ steps.image-ref.outputs.image-ref }} \
+            php -r "
+              \$start = microtime(true);
+              for(\$i = 0; \$i < 1000000; \$i++) {
+                \$x = \$i * 2;
+              }
+              \$end = microtime(true);
+              echo 'Execution time: ' . (\$end - \$start) . ' seconds\n';
+            "
+
+  # Generate release notes and notify
+  release-notification:
+    needs: [build-and-push, security-scan, test-image]
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - name: Create release summary
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+          ## 🚀 Docker Image Release Summary
+          
+          **Image:** `${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}`
+          **Tag:** `${{ github.ref_name }}`
+          **Platforms:** linux/amd64, linux/arm64
+          **Digest:** `${{ needs.build-and-push.outputs.image_digest }}`
+          
+          ### ✅ Completed Checks
+          - Multi-platform build
+          - Security vulnerability scan
+          - Functionality tests
+          - PHP extensions verification
+          - FPM process validation
+          
+          ### 📦 Available Tags
+          ```
+          ${{ needs.build-and-push.outputs.image_tags }}
+          ```
+          
+          ### 🔧 Usage
+          ```bash
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name }}
+          ```
+          EOF
