@@ -68,6 +68,7 @@ RUN apk add --no-cache \
         linux-headers
 RUN chmod +x /usr/local/bin/install-php-extensions &&  \
     install-php-extensions bcmath exif gd gmp intl mysqli pcntl pdo_mysql pdo_pgsql sockets xsl zip redis amqp &&  \
+    install-php-extensions xdebug && \
     apk del .build-deps && \
     rm -rf /var/cache/apk/*
 
