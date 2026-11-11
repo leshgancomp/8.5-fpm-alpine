@@ -79,21 +79,8 @@ COPY --link docker/php/20-app.prod.ini $PHP_INI_DIR/conf.d/
 
 COPY --from=composer:latest /usr/bin/composer /usr/local/bin/composer
 
-# Инициализируем рабочую директорию и настраиваем права (ПОКА МЫ ПОД ROOT)
-WORKDIR /app
-RUN chown symfony:symfony /app
-
-# Копируем скрипт инициализации prod-окружения
-COPY --link --chmod=755 docker/php/docker-entrypoint-prod.sh /usr/local/bin/docker-entrypoint-prod
-
-# Копируем исходный код проекта (используем ID 1000:1000 для совместимости с --link)
-COPY --link --chown=1000:1000 . ./
-
-# Переключаемся на non-root пользователя symfony
 USER symfony
-
+WORKDIR /app
 EXPOSE 9000
 
-# Задаем запуск через прод-скрипт инициализации
-ENTRYPOINT ["docker-entrypoint-prod"]
 CMD ["php-fpm"]
