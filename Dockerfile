@@ -80,21 +80,10 @@ COPY --link docker/php/20-app.dev.ini $PHP_INI_DIR/conf.d/
 
 COPY --from=composer:latest /usr/bin/composer /usr/local/bin/composer
 
-# Инициализируем рабочую папку и делаем symfony её владельцем (ПОКА МЫ ПОД ROOT)
-WORKDIR /app
-RUN chown symfony:symfony /app
-
-# Копируем скрипт инициализации (entrypoint)
-COPY --link --chmod=755 docker/php/docker-entrypoint.sh /usr/local/bin/docker-entrypoint
-
-# Копируем исходный код проекта (используем ID 1000:1000 для совместимости с --link)
-COPY --link --chown=1000:1000 . ./
-
 # Переключаемся на non-root пользователя для безопасной работы приложения
 USER symfony
+WORKDIR /app
 
 EXPOSE 9000
 
-# Задаем entrypoint для автоматического запуска composer install локально
-ENTRYPOINT ["docker-entrypoint"]
 CMD ["php-fpm"]
